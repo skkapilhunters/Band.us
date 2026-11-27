@@ -1,140 +1,272 @@
 import asyncio
 import json
 import os
-import sys
+import re
 import subprocess
+import sys
 from bs4 import BeautifulSoup
 from aiohttp import web
 
-# Global variable to hold scraped results in memory
+TARGET_URL = "https://www.band.us/@reqfwa"
+BAND_ID = "67130116"
+OUTPUT_FILE = "band_posts.json"
+SCROLL_STEPS = 8  # Zyada posts chahiye toh isko badha sakte ho
+
 SCRAPED_DATA = []
+IS_SCRAPING = False
+
 
 def ensure_playwright_browsers():
-    """Ensure Playwright Chromium is installed."""
+    """Terminal ke bina Playwright Chromium ensure karta hai."""
     try:
-        from playwright.async_api import async_playwright
+        from playwright.async_api import async_playwright  # noqa: F401
     except ImportError:
-        print("❌ 'playwright' missing. Please check requirements.txt.")
+        print("❌ 'playwright' install nahi hai. requirements.txt check karein.")
         sys.exit(1)
 
-    print("⚙️ Checking Playwright binaries...")
+    print("⚙️ Playwright Chromium check/install ho raha hai...")
     try:
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        print("✅ Playwright Chromium ready!")
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+        )
+        print("✅ Playwright Chromium ready hai.")
     except Exception as e:
-        print(f"⚠️ Browser install warning: {e}")
+        print(f"⚠️ Browser setup warning: {e}")
 
-async def scrape_band_posts(target_url="https://www.band.us/@reqfwa"):
-    global SCRAPED_DATA
+
+def extract_post_id_from_element(post_el):
+    """Post element ya uske links/attributes se Band post ID (e.g. 153217) nikaalta hai."""
+    # 1. Direct href mein /post/<id> check karo
+    for a_tag in post_el.find_all("a", href=True):
+        match = re.search(r"/band/\d+/post/(\d+)", a_tag["href"])
+        if match:
+            return match.group(1), f"https://www.band.us{match.group(0)}" if a_tag["href"].startswith("/") else a_tag["href"]
+
+    # 2. Element ya parent attributes mein numeric ID check karo
+    for attr in ["data-post-no", "data-postno", "data-post-id", "data-id", "id"]:
+        val = post_el.get(attr)
+        if val:
+            digits = re.search(r"\b(\d{4,})\b", str(val))
+            if digits:
+                pid = digits.group(1)
+                return pid, f"https://www.band.us/band/{BAND_ID}/post/{pid}"
+
+    return None, None
+
+
+def get_all_posts_container(soup):
+    """
+    Page mein 'All Posts' heading/label dhundhta hai aur uske baad ka
+    feed container return karta hai taaki Trending Posts / Notice skip ho sakein.
+    """
+    all_posts_label = soup.find(
+        lambda tag: tag.name in ["h1", "h2", "h3", "h4", "div", "span", "p"]
+        and tag.get_text(strip=True).lower() == "all posts"
+    )
+
+    if all_posts_label:
+        # Sabse kareebi parent section/wrapper uthao jo heading ke neeche posts rakhta ho
+        parent = all_posts_label.find_parent(["section", "div"])
+        if parent and parent.parent:
+            return parent.parent
+        if parent:
+            return parent
+
+    return soup.find("main") or soup.body or soup
+
+
+def parse_all_posts(html_content):
+    """HTML se sirf 'All Posts' section ki posts parse karta hai."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    container = get_all_posts_container(soup)
+
+    # Agar 'All Posts' marker mila hai, toh uske baad ke elements par focus karo
+    all_posts_marker = container.find(
+        lambda tag: tag.name in ["h1", "h2", "h3", "h4", "div", "span", "p"]
+        and tag.get_text(strip=True).lower() == "all posts"
+    )
+
+    candidate_elements = []
+    if all_posts_marker:
+        # Marker ke baad aane wale siblings / descendants dekho
+        for el in all_posts_marker.find_all_next(["div", "article", "li"]):
+            text = " ".join(el.get_text("\n", strip=True).split())
+            if not text or len(text) < 25:
+                continue
+            if "trending posts" in text.lower() and len(text) < 60:
+                continue
+            pid, post_url = extract_post_id_from_element(el)
+            if pid:
+                candidate_elements.append((pid, post_url, el))
+
+    # Fallback: Agar marker ke saath direct post ID wale cards nahi mile toh pure container mein dekho
+    if not candidate_elements:
+        for el in container.find_all(["div", "article"]):
+            pid, post_url = extract_post_id_from_element(el)
+            if pid:
+                candidate_elements.append((pid, post_url, el))
+
+    seen_ids = set()
+    posts = []
+
+    for pid, post_url, el in candidate_elements:
+        if pid in seen_ids:
+            continue
+
+        raw_lines = [
+            line.strip()
+            for line in el.get_text("\n", strip=True).splitlines()
+            if line.strip()
+        ]
+        content = "\n".join(raw_lines)
+
+        # Bohat chhote ya sirf UI buttons wale blocks skip karo
+        if not content or content.lower() == "loading..." or len(content) < 20:
+            continue
+        if content.strip().lower() == "all posts":
+            continue
+
+        seen_ids.add(pid)
+        posts.append({
+            "post_id": pid,
+            "url": post_url,
+            "content": content,
+        })
+
+    return posts
+
+
+async def scrape_band_posts(target_url=TARGET_URL, scroll_steps=SCROLL_STEPS):
+    global SCRAPED_DATA, IS_SCRAPING
+
+    if IS_SCRAPING:
+        print("⏳ Scrape pehle se chal raha hai, skip kar rahe hain.")
+        return SCRAPED_DATA
+
+    IS_SCRAPING = True
     from playwright.async_api import async_playwright
 
-    print(f"🚀 Scraping started for: {target_url}")
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--no-zygote",
-                "--single-process",
-                "--disable-gpu"
-            ]
-        )
+    print(f"🚀 All Posts scraping start: {target_url}")
 
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720}
-        )
-        
-        page = await context.new_page()
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,css,woff,woff2}", lambda route: route.abort())
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-accelerated-2d-canvas",
+                    "--no-first-run",
+                    "--no-zygote",
+                    "--single-process",
+                    "--disable-gpu",
+                ],
+            )
 
-        try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-            
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+            )
+
+            page = await context.new_page()
+
+            # Images/fonts/media block karke RAM aur bandwidth bachao
+            await page.route(
+                "**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,mp4,webm}",
+                lambda route: route.abort(),
+            )
+
             try:
-                await page.wait_for_selector("div.gPostItem, div._postItem, article", timeout=15000)
-            except Exception:
-                await page.wait_for_timeout(5000)
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
 
-            for _ in range(3):
-                await page.mouse.wheel(0, 2500)
-                await page.wait_for_timeout(1500)
+                # Feed render hone ka wait
+                try:
+                    await page.wait_for_function(
+                        "() => document.body && document.body.innerText.toLowerCase().includes('all posts')",
+                        timeout=20000,
+                    )
+                except Exception:
+                    await page.wait_for_timeout(5000)
 
-            html_content = await page.content()
+                # Neeche scroll karke All Posts section ke aur items load karo
+                prev_height = 0
+                for step in range(scroll_steps):
+                    curr_height = await page.evaluate("() => document.body.scrollHeight")
+                    await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(2000)
 
-        finally:
-            await browser.close()
+                    new_height = await page.evaluate("() => document.body.scrollHeight")
+                    print(f"📜 Scroll {step + 1}/{scroll_steps} | height: {curr_height} -> {new_height}")
 
-        soup = BeautifulSoup(html_content, "html.parser")
-        results = []
+                    if new_height == prev_height and new_height == curr_height:
+                        break
+                    prev_height = new_height
 
-        post_elements = soup.select("div.gPostItem, div._postItem, article, div.cPostCard")
-        
-        for idx, post in enumerate(post_elements, 1):
-            text_content = post.get_text(separator="\n", strip=True)
-            if text_content and text_content.lower() != "loading...":
-                results.append({
-                    "post_id": idx,
-                    "content": text_content
-                })
+                html_content = await page.content()
 
-        if not results:
-            main_body = soup.find("main") or soup.find("body")
-            if main_body:
-                text = main_body.get_text(separator="\n", strip=True)
-                if "loading..." not in text.lower()[:50]:
-                    results.append({
-                        "post_id": 1,
-                        "content": text
-                    })
+            finally:
+                await browser.close()
 
+        results = parse_all_posts(html_content)
         SCRAPED_DATA = results
-        
-        # Also write to file locally as backup
-        with open("band_posts.json", "w", encoding="utf-8") as f:
+
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             json.dump(SCRAPED_DATA, f, ensure_ascii=False, indent=4)
 
-        print(f"✅ Scraping finished! Extracted {len(SCRAPED_DATA)} items.")
+        print(f"✅ All Posts scrape complete! Total posts saved: {len(SCRAPED_DATA)}")
+        return SCRAPED_DATA
 
-# Web Routes for Render Subdomain
+    except Exception as e:
+        print(f"❌ Scrape error: {e}")
+        return SCRAPED_DATA
+    finally:
+        IS_SCRAPING = False
+
+
+# --- Render HTTP Server Routes ---
+
 async def handle_root(request):
-    """Raw JSON viewing on browser."""
-    return web.json_response(SCRAPED_DATA)
+    return web.json_response({
+        "band_id": BAND_ID,
+        "section": "All Posts",
+        "is_scraping": IS_SCRAPING,
+        "count": len(SCRAPED_DATA),
+        "posts": SCRAPED_DATA,
+    })
 
-async def handle_trigger(request):
-    """Manually trigger scraping via /scrape URL."""
+
+async def handle_scrape(request):
+    if IS_SCRAPING:
+        return web.json_response({"status": "already_running"}, status=200)
     asyncio.create_task(scrape_band_posts())
-    return web.Response(text="🚀 Scraper triggered in background! Refresh root '/' after a few seconds.")
+    return web.json_response({"status": "triggered", "message": "Scraping All Posts in background."})
+
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get('/', handle_root)
-    app.router.add_get('/scrape', handle_trigger)
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/scrape", handle_scrape)
 
-    # Render automatically sets PORT environment variable
     port = int(os.environ.get("PORT", 10000))
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Web Server listening on port {port}")
+    print(f"🌐 Server running on 0.0.0.0:{port}")
+
 
 async def main():
     ensure_playwright_browsers()
-    
-    # 1. Start Web Server first so Render detects port immediately
     await start_web_server()
-    
-    # 2. Run initial scrape pass
     await scrape_band_posts()
-
-    # Keep server alive
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
