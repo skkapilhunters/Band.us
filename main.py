@@ -4,33 +4,33 @@ import os
 import sys
 import subprocess
 from bs4 import BeautifulSoup
+from aiohttp import web
+
+# Global variable to hold scraped results in memory
+SCRAPED_DATA = []
 
 def ensure_playwright_browsers():
-    """
-    Terminal ki zaroorat nahi hai: Script khud hi check karke
-    Playwright Chromium browser install kar legi.
-    """
+    """Ensure Playwright Chromium is installed."""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        print("❌ 'playwright' library package missing hai. Pehle pip install playwright karein.")
+        print("❌ 'playwright' missing. Please check requirements.txt.")
         sys.exit(1)
 
-    print("⚙️ Playwright browser binaries check ho rahe hain...")
+    print("⚙️ Checking Playwright binaries...")
     try:
-        # Code se hi 'playwright install chromium' execute hoga
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        print("✅ Playwright Chromium successfull install ho gaya!")
+        print("✅ Playwright Chromium ready!")
     except Exception as e:
         print(f"⚠️ Browser install warning: {e}")
 
-async def scrape_band_posts(target_url="https://www.band.us/@reqfwa", output_file="band_posts.json"):
+async def scrape_band_posts(target_url="https://www.band.us/@reqfwa"):
+    global SCRAPED_DATA
     from playwright.async_api import async_playwright
 
     print(f"🚀 Scraping started for: {target_url}")
     
     async with async_playwright() as p:
-        # Hosting environment ke liye memory-friendly browser flags
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -50,22 +50,17 @@ async def scrape_band_posts(target_url="https://www.band.us/@reqfwa", output_fil
             viewport={"width": 1280, "height": 720}
         )
         
-        # Resource blocking to save RAM/Bandwidth on hosting panel
         page = await context.new_page()
         await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,css,woff,woff2}", lambda route: route.abort())
 
         try:
-            # Page navigation & wait
             await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             
-            # Post feed DOM load hone ka wait (max 15 sec)
             try:
                 await page.wait_for_selector("div.gPostItem, div._postItem, article", timeout=15000)
             except Exception:
-                # Content render ke liye fall back wait
                 await page.wait_for_timeout(5000)
 
-            # Lazy-loaded posts grab karne ke liye initial smooth scroll
             for _ in range(3):
                 await page.mouse.wheel(0, 2500)
                 await page.wait_for_timeout(1500)
@@ -75,43 +70,71 @@ async def scrape_band_posts(target_url="https://www.band.us/@reqfwa", output_fil
         finally:
             await browser.close()
 
-        # Parse content with BeautifulSoup
         soup = BeautifulSoup(html_content, "html.parser")
-        scraped_posts = []
+        results = []
 
-        # Target post elements
         post_elements = soup.select("div.gPostItem, div._postItem, article, div.cPostCard")
         
         for idx, post in enumerate(post_elements, 1):
             text_content = post.get_text(separator="\n", strip=True)
             if text_content and text_content.lower() != "loading...":
-                scraped_posts.append({
+                results.append({
                     "post_id": idx,
                     "content": text_content
                 })
 
-        # Fallback parsing
-        if not scraped_posts:
+        if not results:
             main_body = soup.find("main") or soup.find("body")
             if main_body:
                 text = main_body.get_text(separator="\n", strip=True)
                 if "loading..." not in text.lower()[:50]:
-                    scraped_posts.append({
+                    results.append({
                         "post_id": 1,
                         "content": text
                     })
 
-        # Data JSON file mein write karein
-        if scraped_posts:
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(scraped_posts, f, ensure_ascii=False, indent=4)
-            print(f"✅ Total {len(scraped_posts)} posts saved into '{output_file}'!")
-        else:
-            print("⚠️ No valid posts found to write.")
+        SCRAPED_DATA = results
+        
+        # Also write to file locally as backup
+        with open("band_posts.json", "w", encoding="utf-8") as f:
+            json.dump(SCRAPED_DATA, f, ensure_ascii=False, indent=4)
 
-if __name__ == "__main__":
-    # 1. Automatic browser setup without terminal
+        print(f"✅ Scraping finished! Extracted {len(SCRAPED_DATA)} items.")
+
+# Web Routes for Render Subdomain
+async def handle_root(request):
+    """Raw JSON viewing on browser."""
+    return web.json_response(SCRAPED_DATA)
+
+async def handle_trigger(request):
+    """Manually trigger scraping via /scrape URL."""
+    asyncio.create_task(scrape_band_posts())
+    return web.Response(text="🚀 Scraper triggered in background! Refresh root '/' after a few seconds.")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_root)
+    app.router.add_get('/scrape', handle_trigger)
+
+    # Render automatically sets PORT environment variable
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Web Server listening on port {port}")
+
+async def main():
     ensure_playwright_browsers()
     
-    # 2. Run Main Scraper Loop
-    asyncio.run(scrape_band_posts())
+    # 1. Start Web Server first so Render detects port immediately
+    await start_web_server()
+    
+    # 2. Run initial scrape pass
+    await scrape_band_posts()
+
+    # Keep server alive
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
